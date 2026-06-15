@@ -1,6 +1,6 @@
 name: "FireServiceRota Monitor"
 description: "Lytter på FireServiceRota WebSocket og sender udkalds- og bemandingsstatus til Home Assistant via MQTT."
-version: "1.1.1"
+version: "1.1.2"
 slug: "fsr_monitor"
 init: false
 arch:
