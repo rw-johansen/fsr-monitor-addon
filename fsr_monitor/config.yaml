@@ -1,0 +1,35 @@
+name: "FireServiceRota Monitor"
+description: "Lytter på FireServiceRota WebSocket og sender udkalds- og bemandingsstatus til Home Assistant via MQTT."
+version: "1.1.0"
+slug: "fsr_monitor"
+init: false
+arch:
+  - aarch64
+  - amd64
+  - armv7
+homeassistant_api: false
+hassio_api: false
+
+# Brug HA's indbyggede MQTT broker direkte
+services:
+  - mqtt:need
+
+options:
+  email: ""
+  password: ""
+  group_id: "843"
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_password: ""
+  mqtt_prefix: "fsr"
+
+schema:
+  email: str
+  password: str
+  group_id: str
+  mqtt_host: str
+  mqtt_port: int
+  mqtt_user: str
+  mqtt_password: str
+  mqtt_prefix: str
