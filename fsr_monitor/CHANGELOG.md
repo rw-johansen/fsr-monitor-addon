@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.3
+- Fix: tidszone-bug i availability-interval matching der fik personer til at
+  fremstå utilgængelige for tidligt (fx ~1 time før rota-slut)
+- Tilføjet midlertidig logning af valgt interval til fejlfinding
+
+
 ## 1.1.2
 - Nyt FSR logo som ikon
 - group_id er nu tomt som standard
