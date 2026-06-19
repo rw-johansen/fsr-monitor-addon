@@ -23,8 +23,12 @@ Kørsel:
 import asyncio
 import json
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+# Dansk tidszone – håndterer automatisk sommer-/vintertid (CEST/CET)
+LOCAL_TZ = ZoneInfo("Europe/Copenhagen")
 
 import paho.mqtt.client as mqtt
 import websockets
@@ -356,6 +360,25 @@ def publish_all_discoveries() -> None:
     print(f"  → {count_incident} sensorer oprettet for udkald og tilgængelighed", flush=True)
 
 
+def _parse_fsr_time(ts: str):
+    """
+    Parser FSR's ISO8601-tidsstempler til et tidszone-bevidst datetime-objekt.
+    Håndterer både 'Z'-suffiks (UTC) og tidsstempler uden tidszone-info
+    (antages da at være dansk lokal tid).
+    Returnerer None hvis tidsstemplet ikke kan tolkes.
+    """
+    if not ts:
+        return None
+    try:
+        cleaned = ts.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(cleaned)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=LOCAL_TZ)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
 def publish_availability(msg: dict) -> None:
     """
     Publicerer bemandingsstatus til MQTT.
@@ -394,25 +417,38 @@ def publish_availability(msg: dict) -> None:
         _discovered_availability.add(ar_id)
         publish_discovery_availability(ar_id, ar_name)
 
-    # Find det aktive interval (start <= nu < slut)
-    now_str   = datetime.now().isoformat()
+    # Find det aktive interval (start <= nu < slut) – tidszone-bevidst sammenligning
+    now_dt    = datetime.now(timezone.utc)
     intervals = msg.get("intervals", [])
     interval  = None
 
     for iv in intervals:
-        iv_start = iv.get("start_time", "")
-        iv_end   = iv.get("end_time",   "")
-        if iv_start <= now_str <= iv_end:
+        start_dt = _parse_fsr_time(iv.get("start_time", ""))
+        end_dt   = _parse_fsr_time(iv.get("end_time", ""))
+        if start_dt and end_dt and start_dt <= now_dt <= end_dt:
             interval = iv
             break
 
-    # Fallback: brug første interval hvis intet matcher præcist
+    # Fallback: brug det interval hvis intet matcher præcist (kan ske ved data-gaps)
     if interval is None and intervals:
         interval = intervals[0]
+        print(
+            f"[AVAILABILITY] Intet interval matchede {now_dt.isoformat()} – "
+            f"bruger fallback (første interval i listen)",
+            flush=True,
+        )
 
     if interval is None:
         print(f"[AVAILABILITY] Ingen intervals i besked for {ar_name}", flush=True)
         return
+
+    # Midlertidig log – bekræfter at det rigtige interval vælges
+    print(
+        f"[AVAILABILITY] {ar_name}: interval {interval.get('start_time')} "
+        f"-> {interval.get('end_time')} (nu UTC={now_dt.isoformat()}), "
+        f"{len(interval.get('available_memberships', []))} tilgængelige",
+        flush=True,
+    )
 
     warning_level   = interval.get("warning_level", "")
     service_level   = interval.get("service_level", "")
