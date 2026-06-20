@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.4
+- Ny knap i HA: "FSR – Genopfrisk tilgængelighed" (mqtt button-entitet)
+  der øjeblikkeligt genberegner availability og gen-abonnerer på FSR
+  for at hente et frisk snapshot
+- Automatisk genberegning hvert minut i baggrunden, så et interval-skifte
+  opdages selv uden en ny WebSocket-besked fra FSR
+
+
 ## 1.1.3
 - Fix: tidszone-bug i availability-interval matching der fik personer til at
   fremstå utilgængelige for tidligt (fx ~1 time før rota-slut)
