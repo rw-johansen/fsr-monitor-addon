@@ -30,6 +30,14 @@ from zoneinfo import ZoneInfo
 # Dansk tidszone – håndterer automatisk sommer-/vintertid (CEST/CET)
 LOCAL_TZ = ZoneInfo("Europe/Copenhagen")
 
+# Refresh-mekanisme: reference til hoved-event-loop (sat i main()),
+# cache af seneste rå availability-besked pr. requirement, og reference
+# til den aktive websocket-forbindelse for availability-kanalen.
+_main_loop = None
+_last_availability_msg: dict = {}
+_availability_ws = None
+_availability_sub_params: dict | None = None
+
 import paho.mqtt.client as mqtt
 import websockets
 from rich.console import Console
@@ -115,6 +123,12 @@ CHANNELS = [
 # ───────────────────────────────────────────────────────────
 
 def _build_mqtt_client() -> mqtt.Client:
+    def _on_message(client, userdata, msg):
+        if msg.topic == f"{MQTT_PREFIX}/command/refresh_availability":
+            print("[REFRESH] Manuel genopfriskning anmodet via knap", flush=True)
+            if _main_loop is not None:
+                asyncio.run_coroutine_threadsafe(_do_manual_refresh(), _main_loop)
+
     try:
         # paho-mqtt >= 2.0
         client = mqtt.Client(
@@ -135,6 +149,7 @@ def _build_mqtt_client() -> mqtt.Client:
     client.on_connect = lambda c, *_: c.publish(
         f"{MQTT_PREFIX}/status", "online", retain=True
     )
+    client.on_message = _on_message
     client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
     client.loop_start()
 
@@ -144,6 +159,7 @@ def _build_mqtt_client() -> mqtt.Client:
     for _ in range(20):
         if client.is_connected():
             client.publish(f"{MQTT_PREFIX}/status", "online", retain=True)
+            client.subscribe(f"{MQTT_PREFIX}/command/refresh_availability")
             break
         time.sleep(0.1)
 
@@ -305,6 +321,76 @@ _discovered_availability: set[int] = set()
 _discovered_user_availability: set[int] = set()
 
 
+def publish_discovery_refresh_button() -> None:
+    """Registrer en knap i HA der trigger manuel genopfriskning af availability."""
+    if mqtt_client is None:
+        return
+    payload = {
+        "name":                  "FSR – Genopfrisk tilgængelighed",
+        "unique_id":             f"fsr_{GROUP_ID}_refresh_availability",
+        "command_topic":         f"{MQTT_PREFIX}/command/refresh_availability",
+        "payload_press":         "PRESS",
+        "icon":                  "mdi:refresh",
+        "availability_topic":    f"{MQTT_PREFIX}/status",
+        "payload_available":     "online",
+        "payload_not_available": "offline",
+        "device":                _DEVICE,
+    }
+    topic = f"{_HA_DISCOVERY_PREFIX}/button/fsr_{GROUP_ID}_refresh_availability/config"
+    try:
+        mqtt_client.publish(topic, json.dumps(payload, ensure_ascii=False), retain=True)
+        log_write("_token", "Auto-discovery: refresh-knap registreret")
+    except Exception:
+        pass
+
+
+def _recompute_all_cached_availability() -> None:
+    """
+    Genberegner og genpublicerer availability for alle kendte requirements
+    ud fra den senest modtagne rå besked – uden at vente på en ny
+    WebSocket-besked fra FSR. Løser det tilfælde hvor et interval-skifte
+    sker uden at noget trigger en ny push-besked.
+    """
+    for ar_id, raw_msg in list(_last_availability_msg.items()):
+        try:
+            publish_availability(raw_msg)
+        except Exception as e:
+            print(f"[REFRESH] Fejl ved genberegning af ar_id={ar_id}: {e}", flush=True)
+
+
+async def _do_manual_refresh() -> None:
+    """
+    Køres når 'Genopfrisk tilgængelighed'-knappen trykkes i HA.
+    1) Genberegner straks ud fra cache (øjeblikkeligt resultat)
+    2) Sender et gen-abonnement til FSR for at bede om et frisk snapshot
+    """
+    print("[REFRESH] Genberegner fra cache...", flush=True)
+    _recompute_all_cached_availability()
+
+    if _availability_ws is not None and _availability_sub_params is not None:
+        try:
+            sub = json.dumps({
+                "command":    "subscribe",
+                "identifier": json.dumps(_availability_sub_params),
+            })
+            await _availability_ws.send(sub)
+            print("[REFRESH] Gen-abonnement sendt til FSR – venter på frisk data", flush=True)
+        except Exception as e:
+            print(f"[REFRESH] Kunne ikke gen-abonnere: {e}", flush=True)
+    else:
+        print("[REFRESH] Ingen aktiv availability-forbindelse at gen-abonnere på", flush=True)
+
+
+async def availability_periodic_refresh_loop(interval_sec: int = 60) -> None:
+    """
+    Genberegner automatisk hvert minut, så et interval-skifte opdages
+    selv hvis FSR ikke sender en ny besked netop på skiftetidspunktet.
+    """
+    while True:
+        await asyncio.sleep(interval_sec)
+        _recompute_all_cached_availability()
+
+
 def publish_discovery_user_availability(user_id: int, name: str) -> None:
     """Registrer én brugers tilgængeligheds-sensor i HA via auto-discovery."""
     if mqtt_client is None or user_id in _discovered_user_availability:
@@ -411,6 +497,9 @@ def publish_availability(msg: dict) -> None:
     if not ar_id:
         print(f"[AVAILABILITY] Ingen ar_id – nøgler: {list(msg.keys())}", flush=True)
         return
+
+    # Cache den rå besked, så vi kan genberegne uden ny WebSocket-besked
+    _last_availability_msg[ar_id] = msg
 
     # Auto-discovery første gang
     if ar_id not in _discovered_availability:
@@ -794,6 +883,7 @@ def summarise(channel_id: str, msg: dict) -> str:
 # ───────────────────────────────────────────────────────────
 
 async def listen(ch: dict, reconnect_delay: int = 5) -> None:
+    global _availability_ws, _availability_sub_params
     cid = ch["id"]
 
     while True:
@@ -815,6 +905,12 @@ async def listen(ch: dict, reconnect_delay: int = 5) -> None:
                 statuses[cid] = "Forbundet"
                 log_write(cid, f"=== FORBUNDET – {ch['params']['channel']} ===")
                 await ws.send(sub)
+
+                # Gem reference til availability-forbindelsen, så vi kan
+                # gen-abonnere ved manuel genopfriskning
+                if cid == "availability":
+                    _availability_ws = ws
+                    _availability_sub_params = ch["params"]
 
                 async for raw in ws:
                     try:
@@ -870,6 +966,8 @@ async def listen(ch: dict, reconnect_delay: int = 5) -> None:
         except (websockets.ConnectionClosed, ConnectionRefusedError, OSError) as exc:
             statuses[cid] = "Afbrudt – genforbinder..."
             log_write(cid, f"AFBRUDT: {exc}")
+            if cid == "availability":
+                _availability_ws = None
             await asyncio.sleep(reconnect_delay)
         except Exception as exc:
             statuses[cid] = f"FEJL: {exc}"
@@ -990,6 +1088,9 @@ async def prefill_user_names() -> None:
 # ───────────────────────────────────────────────────────────
 
 async def main() -> None:
+    global _main_loop
+    _main_loop = asyncio.get_event_loop()
+
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     print("Henter access token via pyfireservicerota...")
@@ -1007,14 +1108,16 @@ async def main() -> None:
     print("Opretter sensorer for alle brugere...")
     publish_all_discoveries()
 
-    # Registrer hændelses-sensoren i HA med det samme
+    # Registrer hændelses-sensoren og refresh-knappen i HA med det samme
     publish_discovery_incident()
+    publish_discovery_refresh_button()
 
     layout  = build_layout()
     console = Console()
 
     tasks = [
         asyncio.create_task(token_mgr.background_refresh_loop()),
+        asyncio.create_task(availability_periodic_refresh_loop()),
         *[asyncio.create_task(listen(ch)) for ch in CHANNELS],
     ]
 
