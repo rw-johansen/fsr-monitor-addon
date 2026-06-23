@@ -353,7 +353,7 @@ async def _do_manual_refresh() -> None:
         print(f"[REFRESH] Fejl: {e}", flush=True)
 
 
-async def availability_periodic_refresh_loop(interval_sec: int = 60) -> None:
+async def availability_periodic_refresh_loop(interval_sec: int = 20) -> None:
     """
     Henter automatisk et frisk REST-snapshot hvert minut, så status
     er aktuel uden at brugeren skal trykke på genopfriskningsknappen.
