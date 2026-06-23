@@ -23,7 +23,7 @@ Kørsel:
 import asyncio
 import json
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -362,10 +362,17 @@ async def _do_manual_refresh() -> None:
     """
     Køres når 'Genopfrisk tilgængelighed'-knappen trykkes i HA.
     1) Genberegner straks ud fra cache (øjeblikkeligt resultat)
-    2) Sender et gen-abonnement til FSR for at bede om et frisk snapshot
+    2) Forsøger at hente et frisk snapshot via REST API
+    3) Sender et gen-abonnement til FSR som ekstra forsøg
     """
     print("[REFRESH] Genberegner fra cache...", flush=True)
     _recompute_all_cached_availability()
+
+    print("[REFRESH] Forsøger REST-snapshot...", flush=True)
+    try:
+        await fetch_availability_snapshot()
+    except Exception as e:
+        print(f"[REFRESH] REST-snapshot fejl: {e}", flush=True)
 
     if _availability_ws is not None and _availability_sub_params is not None:
         try:
@@ -500,6 +507,7 @@ def publish_availability(msg: dict) -> None:
 
     # Cache den rå besked, så vi kan genberegne uden ny WebSocket-besked
     _last_availability_msg[ar_id] = msg
+    _known_ar_ids.add(ar_id)
 
     # Auto-discovery første gang
     if ar_id not in _discovered_availability:
@@ -1084,8 +1092,85 @@ async def prefill_user_names() -> None:
 
 
 # ───────────────────────────────────────────────────────────
-# MAIN
+# AVAILABILITY SNAPSHOT VIA REST  (workaround for at WebSocket
+# kun sender deltas, ikke et fuldt snapshot ved (gen)abonnement)
 # ───────────────────────────────────────────────────────────
+
+# Kendte requirement-ID'er vi har set via WebSocket – bruges som fallback
+# hvis vi ikke kan liste dem via REST før første WebSocket-besked
+_known_ar_ids: set[int] = set()
+
+
+async def fetch_availability_snapshot() -> bool:
+    """
+    Forsøger at hente et frisk availability-snapshot via REST API i stedet
+    for at vente på en WebSocket-besked (som kun sendes ved ændringer).
+
+    Da det eksakte REST-endpoint ikke er dokumenteret offentligt, afprøves
+    flere sandsynlige varianter, og det rå svar logges, så det kan
+    identificeres og rettes præcist.
+
+    Returnerer True hvis mindst ét endpoint gav brugbar data.
+    """
+    import requests as req_lib
+
+    token = await token_mgr.ensure_valid()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept":        "application/json",
+    }
+
+    now = datetime.now(LOCAL_TZ)
+    start = now.strftime("%Y-%m-%dT00:00:00%z")
+    end   = (now + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00%z")
+
+    # Kendte/sandsynlige requirement-ID'er at prøve
+    ar_ids_to_try = list(_known_ar_ids) or [1274]  # 1274 = Nyborg, set som fallback
+
+    candidates = []
+    for ar_id in ar_ids_to_try:
+        candidates += [
+            f"https://{BASE_URL}/api/v2/availability_requirements/{ar_id}",
+            f"https://{BASE_URL}/api/v2/availability_requirements/{ar_id}?start_time={start}&end_time={end}",
+            f"https://{BASE_URL}/api/v2/availability_requirements/{ar_id}/intervals?start_time={start}&end_time={end}",
+            f"https://{BASE_URL}/api/v2/group_availability_requirements/{ar_id}",
+        ]
+    candidates += [
+        f"https://{BASE_URL}/api/v2/availability_requirements?group_id={GROUP_ID}",
+        f"https://{BASE_URL}/api/v2/groups/{GROUP_ID}/availability_requirements",
+    ]
+
+    loop = asyncio.get_event_loop()
+    found_any = False
+
+    for url in candidates:
+        def _fetch(u=url):
+            resp = req_lib.get(u, headers=headers, timeout=10)
+            return resp.status_code, resp.text
+
+        try:
+            status, raw = await loop.run_in_executor(None, _fetch)
+            preview = raw[:400]
+            print(f"[SNAPSHOT] {url} -> HTTP {status}: {preview}", flush=True)
+            log_write("_token", f"Snapshot probe {url} -> HTTP {status}: {raw[:1000]}")
+
+            if status == 200:
+                data = json.loads(raw)
+                # Hvis svaret indeholder intervals direkte, eller en liste
+                # af requirements, forsøg at publicere via eksisterende logik
+                if isinstance(data, dict) and "intervals" in data:
+                    publish_availability(data)
+                    found_any = True
+                elif isinstance(data, list):
+                    for entry in data:
+                        if isinstance(entry, dict) and "intervals" in entry:
+                            publish_availability(entry)
+                            found_any = True
+
+        except Exception as e:
+            print(f"[SNAPSHOT] Fejl for {url}: {e}", flush=True)
+
+    return found_any
 
 async def main() -> None:
     global _main_loop
@@ -1111,6 +1196,14 @@ async def main() -> None:
     # Registrer hændelses-sensoren og refresh-knappen i HA med det samme
     publish_discovery_incident()
     publish_discovery_refresh_button()
+
+    print("Henter frisk availability-snapshot via REST...")
+    got_snapshot = await fetch_availability_snapshot()
+    if got_snapshot:
+        print("  → Snapshot hentet og publiceret")
+    else:
+        print("  → Intet snapshot-endpoint virkede – se [SNAPSHOT]-linjer ovenfor")
+        print("     (data opdateres når første WebSocket-besked ankommer)")
 
     layout  = build_layout()
     console = Console()
