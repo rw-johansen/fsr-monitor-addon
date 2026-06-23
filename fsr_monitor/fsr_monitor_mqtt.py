@@ -912,6 +912,16 @@ async def fetch_ar_definitions() -> None:
         print(f"[AR] Fejl ved hentning af krav-definitioner: {e}", flush=True)
 
 
+# Specielle availability_code_id'er der vises med eget label i stedet
+# for "Tilgængelig" – kun disse to medtages, alle andre koder ignoreres.
+#   662 = "Sidst ved udkald"
+#   909 = "On Mission"
+_SPECIAL_AVAILABILITY_CODES = {
+    662: "Sidst ved udkald",
+    909: "On Mission",
+}
+
+
 async def fetch_current_availability() -> bool:
     """
     Henter et live availability-snapshot via REST – bekræftet endpoint:
@@ -980,10 +990,18 @@ async def fetch_current_availability() -> bool:
         if not uid or not intervals:
             continue
 
-        iv           = intervals[0]   # Matcher altid forespurgt start_time = nu
-        is_available = bool(iv.get("available"))
-        skill_ids    = iv.get("skill_ids", [])
-        name         = _user_names.get(uid, f"bruger_{uid}")
+        iv             = intervals[0]   # Matcher altid forespurgt start_time = nu
+        is_available   = bool(iv.get("available"))
+        skill_ids      = iv.get("skill_ids", [])
+        name           = _user_names.get(uid, f"bruger_{uid}")
+        code_id        = iv.get("availability_code_id")
+
+        # Specielle koder vises med eget label, på samme måde som
+        # "Tilgængelig"/"Ikke tilgængelig" – kun disse to koder medtages
+        if code_id in _SPECIAL_AVAILABILITY_CODES:
+            status_label = _SPECIAL_AVAILABILITY_CODES[code_id]
+        else:
+            status_label = "Tilgængelig" if is_available else "Ikke tilgængelig"
 
         publish_discovery_user_availability(uid, name)
         mqtt_publish(
@@ -992,7 +1010,8 @@ async def fetch_current_availability() -> bool:
                 "user_id":               uid,
                 "name":                  name,
                 "available":             is_available,
-                "status_label":          "Tilgængelig" if is_available else "Ikke tilgængelig",
+                "status_label":          status_label,
+                "availability_code_id":  code_id,
                 "skill_ids":             skill_ids,
                 "assigned_function_ids": iv.get("assigned_function_ids", []),
                 "valid_until":           iv.get("end_time", ""),
