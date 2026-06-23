@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.1
+- Tilføjet support for availability_code_id 662 ("Sidst ved udkald") og
+  909 ("On Mission") – vises nu som status_label på samme måde som
+  "Tilgængelig"/"Ikke tilgængelig" når koden er aktiv på en person
+
+
 ## 1.2.0
 - **Stor ændring:** Availability hentes nu via REST-polling i stedet for
   WebSocket-deltas. Bekræftet endpoint:
