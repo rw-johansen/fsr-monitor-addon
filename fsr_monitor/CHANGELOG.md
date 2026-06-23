@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.2.0
+- **Stor ændring:** Availability hentes nu via REST-polling i stedet for
+  WebSocket-deltas. Bekræftet endpoint:
+  `GET /api/v2/memberships/combined_schedules?group_ids=X&start_time=nu`
+- Løser rodproblemet bag "alle står som utilgængelig efter genstart" –
+  WebSocket-kanalen sendte kun ændringer, ikke et fuldt snapshot ved
+  (gen)abonnement
+- Fjerner al klient-side tidszone-matching – da vi spørger om "nu" får vi
+  altid det korrekte interval direkte fra serveren
+- Bemandingskrav (minimum pr. skill) hentes separat via
+  `GET /api/v2/availability_requirements?group_id=X` og kombineres med
+  live-data for at vise korrekt over/under-bemanding
+- "Genopfrisk tilgængelighed"-knappen og den automatiske opdatering hvert
+  minut bruger nu begge det samme REST-endpoint – øjeblikkeligt resultat,
+  ingen ventetid på WebSocket-beskeder
+
+
 ## 1.1.5
 - Diagnose: WebSocket-kanalen for availability sender sandsynligvis kun
   deltas (ændringer), ikke et fuldt snapshot ved abonnement – dette
