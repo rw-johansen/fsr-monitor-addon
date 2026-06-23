@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.5
+- Diagnose: WebSocket-kanalen for availability sender sandsynligvis kun
+  deltas (ændringer), ikke et fuldt snapshot ved abonnement – dette
+  forklarer hvorfor alle stod som "Ikke tilgængelig" efter genstart
+- Tilføjet REST-baseret snapshot-forsøg ved opstart og ved manuel
+  genopfriskning. Flere sandsynlige endpoints afprøves og logges
+  med [SNAPSHOT]-præfiks, da det eksakte endpoint ikke er bekræftet endnu
+
+
 ## 1.1.4
 - Ny knap i HA: "FSR – Genopfrisk tilgængelighed" (mqtt button-entitet)
   der øjeblikkeligt genberegner availability og gen-abonnerer på FSR
