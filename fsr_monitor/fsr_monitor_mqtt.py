@@ -30,13 +30,9 @@ from zoneinfo import ZoneInfo
 # Dansk tidszone – håndterer automatisk sommer-/vintertid (CEST/CET)
 LOCAL_TZ = ZoneInfo("Europe/Copenhagen")
 
-# Refresh-mekanisme: reference til hoved-event-loop (sat i main()),
-# cache af seneste rå availability-besked pr. requirement, og reference
-# til den aktive websocket-forbindelse for availability-kanalen.
+# Reference til hoved-event-loop, sat i main() – bruges til at
+# kalde async refresh-funktionen fra MQTT-knappens callback-tråd
 _main_loop = None
-_last_availability_msg: dict = {}
-_availability_ws = None
-_availability_sub_params: dict | None = None
 
 import paho.mqtt.client as mqtt
 import websockets
@@ -344,58 +340,30 @@ def publish_discovery_refresh_button() -> None:
         pass
 
 
-def _recompute_all_cached_availability() -> None:
-    """
-    Genberegner og genpublicerer availability for alle kendte requirements
-    ud fra den senest modtagne rå besked – uden at vente på en ny
-    WebSocket-besked fra FSR. Løser det tilfælde hvor et interval-skifte
-    sker uden at noget trigger en ny push-besked.
-    """
-    for ar_id, raw_msg in list(_last_availability_msg.items()):
-        try:
-            publish_availability(raw_msg)
-        except Exception as e:
-            print(f"[REFRESH] Fejl ved genberegning af ar_id={ar_id}: {e}", flush=True)
-
-
 async def _do_manual_refresh() -> None:
     """
     Køres når 'Genopfrisk tilgængelighed'-knappen trykkes i HA.
-    1) Genberegner straks ud fra cache (øjeblikkeligt resultat)
-    2) Forsøger at hente et frisk snapshot via REST API
-    3) Sender et gen-abonnement til FSR som ekstra forsøg
+    Henter et frisk live snapshot direkte via REST – ingen cache,
+    ingen WebSocket-gen-abonnement nødvendig.
     """
-    print("[REFRESH] Genberegner fra cache...", flush=True)
-    _recompute_all_cached_availability()
-
-    print("[REFRESH] Forsøger REST-snapshot...", flush=True)
+    print("[REFRESH] Henter frisk availability-snapshot via REST...", flush=True)
     try:
-        await fetch_availability_snapshot()
+        await fetch_current_availability()
     except Exception as e:
-        print(f"[REFRESH] REST-snapshot fejl: {e}", flush=True)
-
-    if _availability_ws is not None and _availability_sub_params is not None:
-        try:
-            sub = json.dumps({
-                "command":    "subscribe",
-                "identifier": json.dumps(_availability_sub_params),
-            })
-            await _availability_ws.send(sub)
-            print("[REFRESH] Gen-abonnement sendt til FSR – venter på frisk data", flush=True)
-        except Exception as e:
-            print(f"[REFRESH] Kunne ikke gen-abonnere: {e}", flush=True)
-    else:
-        print("[REFRESH] Ingen aktiv availability-forbindelse at gen-abonnere på", flush=True)
+        print(f"[REFRESH] Fejl: {e}", flush=True)
 
 
 async def availability_periodic_refresh_loop(interval_sec: int = 60) -> None:
     """
-    Genberegner automatisk hvert minut, så et interval-skifte opdages
-    selv hvis FSR ikke sender en ny besked netop på skiftetidspunktet.
+    Henter automatisk et frisk REST-snapshot hvert minut, så status
+    er aktuel uden at brugeren skal trykke på genopfriskningsknappen.
     """
     while True:
         await asyncio.sleep(interval_sec)
-        _recompute_all_cached_availability()
+        try:
+            await fetch_current_availability()
+        except Exception as e:
+            print(f"[AVAILABILITY] Periodisk opdatering fejlede: {e}", flush=True)
 
 
 def publish_discovery_user_availability(user_id: int, name: str) -> None:
@@ -452,189 +420,6 @@ def publish_all_discoveries() -> None:
     log_write("_token", f"Startup discovery: {count_incident} incident + {count_avail} availability sensorer publiceret")
     print(f"  → {count_incident} sensorer oprettet for udkald og tilgængelighed", flush=True)
 
-
-def _parse_fsr_time(ts: str):
-    """
-    Parser FSR's ISO8601-tidsstempler til et tidszone-bevidst datetime-objekt.
-    Håndterer både 'Z'-suffiks (UTC) og tidsstempler uden tidszone-info
-    (antages da at være dansk lokal tid).
-    Returnerer None hvis tidsstemplet ikke kan tolkes.
-    """
-    if not ts:
-        return None
-    try:
-        cleaned = ts.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(cleaned)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=LOCAL_TZ)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-
-def publish_availability(msg: dict) -> None:
-    """
-    Publicerer bemandingsstatus til MQTT.
-
-    Faktisk beskedstruktur fra FSR:
-    {
-      "availability_requirement": { "id": 1274, "name": "Nyborg", ... },
-      "start_time": "...",
-      "end_time": "...",
-      "intervals": [
-        {
-          "start_time": "...",
-          "end_time": "...",
-          "warning_level": "above_buffer",
-          "service_level": "in_service",
-          "available_memberships": [...],
-          "skill_statuses": [...]
-        },
-        ...
-      ]
-    }
-
-    Finder det interval der er aktivt nu, og publicerer det til MQTT.
-    MQTT-emne: fsr/availability/<requirement_id>
-    """
-    ar      = msg.get("availability_requirement", {})
-    ar_id   = ar.get("id")
-    ar_name = ar.get("name", str(ar_id))
-
-    if not ar_id:
-        print(f"[AVAILABILITY] Ingen ar_id – nøgler: {list(msg.keys())}", flush=True)
-        return
-
-    # Cache den rå besked, så vi kan genberegne uden ny WebSocket-besked
-    _last_availability_msg[ar_id] = msg
-    _known_ar_ids.add(ar_id)
-
-    # Auto-discovery første gang
-    if ar_id not in _discovered_availability:
-        _discovered_availability.add(ar_id)
-        publish_discovery_availability(ar_id, ar_name)
-
-    # Find det aktive interval (start <= nu < slut) – tidszone-bevidst sammenligning
-    now_dt    = datetime.now(timezone.utc)
-    intervals = msg.get("intervals", [])
-    interval  = None
-
-    for iv in intervals:
-        start_dt = _parse_fsr_time(iv.get("start_time", ""))
-        end_dt   = _parse_fsr_time(iv.get("end_time", ""))
-        if start_dt and end_dt and start_dt <= now_dt <= end_dt:
-            interval = iv
-            break
-
-    # Fallback: brug det interval hvis intet matcher præcist (kan ske ved data-gaps)
-    if interval is None and intervals:
-        interval = intervals[0]
-        print(
-            f"[AVAILABILITY] Intet interval matchede {now_dt.isoformat()} – "
-            f"bruger fallback (første interval i listen)",
-            flush=True,
-        )
-
-    if interval is None:
-        print(f"[AVAILABILITY] Ingen intervals i besked for {ar_name}", flush=True)
-        return
-
-    # Midlertidig log – bekræfter at det rigtige interval vælges
-    print(
-        f"[AVAILABILITY] {ar_name}: interval {interval.get('start_time')} "
-        f"-> {interval.get('end_time')} (nu UTC={now_dt.isoformat()}), "
-        f"{len(interval.get('available_memberships', []))} tilgængelige",
-        flush=True,
-    )
-
-    warning_level   = interval.get("warning_level", "")
-    service_level   = interval.get("service_level", "")
-    memberships     = interval.get("available_memberships", [])
-    available_count = len(memberships)
-
-    # Navneliste fra cache + publicer per-bruger availability
-    available_user_ids = {m.get("user_id") for m in memberships}
-    available_people   = []
-
-    for m in memberships:
-        uid   = m.get("user_id")
-        name  = _user_names.get(uid, f"bruger_{uid}")
-        code  = m.get("availability_code", "")
-        funcs = m.get("assigned_functions", [])
-        skills = m.get("skill_ids", [])
-
-        available_people.append({
-            "user_id":           uid,
-            "name":              name,
-            "availability_code": code,
-            "assigned_functions": funcs,
-            "skill_ids":         skills,
-        })
-
-        # Publicer individuel tilgængeligheds-sensor
-        publish_discovery_user_availability(uid, name)
-        mqtt_publish(
-            f"user/{uid}/availability",
-            {
-                "user_id":            uid,
-                "name":               name,
-                "available":          True,
-                "status_label":       "Tilgængelig",
-                "availability_code":  code,
-                "assigned_functions": funcs,
-                "skill_ids":          skills,
-            },
-            retain=True,
-        )
-
-    # Sæt alle IKKE-tilgængelige brugere til "Ikke tilgængelig"
-    for uid, name in _user_names.items():
-        if uid not in available_user_ids:
-            mqtt_publish(
-                f"user/{uid}/availability",
-                {
-                    "user_id":      uid,
-                    "name":         name,
-                    "available":    False,
-                    "status_label": "Ikke tilgængelig",
-                    "skill_ids":    [],
-                    "availability_code": "",
-                },
-                retain=True,
-            )
-
-    # Skill-status med navne
-    skill_summary = []
-    for ss in interval.get("skill_statuses", []):
-        assigned_names = [
-            _user_names.get(sm.get("user_id"), f"bruger_{sm.get('user_id')}")
-            for sm in ss.get("available_memberships", [])
-        ]
-        skill_summary.append({
-            "skill_id": ss.get("skill_id"),
-            "assigned": ss.get("assigned_count", 0),
-            "minimum":  ss.get("minimum", 0),
-            "level":    ss.get("level", ""),
-            "names":    assigned_names,
-        })
-
-    mqtt_publish(
-        f"availability/{ar_id}",
-        {
-            "ar_id":            ar_id,
-            "name":             ar_name,
-            "level":            warning_level,
-            "level_label":      _LEVEL_LABEL.get(warning_level, warning_level),
-            "service_level":    service_level,
-            "available_count":  available_count,
-            "available_people": available_people,
-            "skill_statuses":   skill_summary,
-            "interval_start":   interval.get("start_time", ""),
-            "interval_end":     interval.get("end_time", ""),
-            "updated_at":       datetime.now().isoformat(timespec="seconds"),
-        },
-        retain=True,
-    )
 
 def publish_incident(msg: dict) -> None:
     """
@@ -891,7 +676,6 @@ def summarise(channel_id: str, msg: dict) -> str:
 # ───────────────────────────────────────────────────────────
 
 async def listen(ch: dict, reconnect_delay: int = 5) -> None:
-    global _availability_ws, _availability_sub_params
     cid = ch["id"]
 
     while True:
@@ -914,12 +698,6 @@ async def listen(ch: dict, reconnect_delay: int = 5) -> None:
                 log_write(cid, f"=== FORBUNDET – {ch['params']['channel']} ===")
                 await ws.send(sub)
 
-                # Gem reference til availability-forbindelsen, så vi kan
-                # gen-abonnere ved manuel genopfriskning
-                if cid == "availability":
-                    _availability_ws = ws
-                    _availability_sub_params = ch["params"]
-
                 async for raw in ws:
                     try:
                         msg = json.loads(raw)
@@ -938,44 +716,18 @@ async def listen(ch: dict, reconnect_delay: int = 5) -> None:
                     ts = datetime.now().strftime("%H:%M:%S")
                     buffers[cid].append((ts, summarise(cid, msg)))
 
-                    # Log interval-struktur (fjernes når det virker)
-                    if cid == "availability":
-                        inner_msg  = msg.get("message", {})
-                        intervals  = inner_msg.get("intervals", [])
-                        print(f"[AV] intervals count={len(intervals)}", flush=True)
-                        if intervals:
-                            iv = intervals[0]
-                            print(f"[AV] INTERVAL[0] KEYS: {sorted(iv.keys())}", flush=True)
-                            print(f"[AV] INTERVAL[0] warning_level={iv.get('warning_level','–')}", flush=True)
-                            am = iv.get("available_memberships", [])
-                            print(f"[AV] INTERVAL[0] available_memberships count={len(am)}", flush=True)
-                            if am:
-                                print(f"[AV] FIRST MEMBER KEYS: {sorted(am[0].keys())}", flush=True)
-
                     # ── MQTT: publicer kun for incidents-kanalen ──
+                    # (availability håndteres nu via periodisk REST-polling,
+                    #  se fetch_current_availability() – WebSocket-kanalen
+                    #  for availability bruges kun til log/visning herover)
                     if cid == "incidents":
                         inner = msg.get("message", {})
                         if isinstance(inner, dict) and inner.get("id"):
                             publish_incident(inner)
 
-                    # ── MQTT: publicer for availability-kanalen ──
-                    elif cid == "availability":
-                        inner = msg.get("message", msg)
-                        if isinstance(inner, (dict, list)):
-                            try:
-                                publish_availability(inner)
-                            except Exception as e:
-                                log_write(cid, f"MQTT availability fejl: {e}")
-                                print(f"[AVAILABILITY FEJL] {e}", flush=True)
-                        else:
-                            print(f"[AVAILABILITY] Uventet type: {type(inner)} – {str(inner)[:200]}", flush=True)
-                            log_write(cid, f"Uventet type: {type(inner)} – {str(inner)[:200]}")
-
         except (websockets.ConnectionClosed, ConnectionRefusedError, OSError) as exc:
             statuses[cid] = "Afbrudt – genforbinder..."
             log_write(cid, f"AFBRUDT: {exc}")
-            if cid == "availability":
-                _availability_ws = None
             await asyncio.sleep(reconnect_delay)
         except Exception as exc:
             statuses[cid] = f"FEJL: {exc}"
@@ -1092,27 +844,87 @@ async def prefill_user_names() -> None:
 
 
 # ───────────────────────────────────────────────────────────
-# AVAILABILITY SNAPSHOT VIA REST  (workaround for at WebSocket
-# kun sender deltas, ikke et fuldt snapshot ved (gen)abonnement)
+# AVAILABILITY VIA REST  (bekræftet virkende endpoints – ingen
+# tidszone-matching nødvendig, da vi spørger om "nu" direkte)
 # ───────────────────────────────────────────────────────────
 
-# Kendte requirement-ID'er vi har set via WebSocket – bruges som fallback
-# hvis vi ikke kan liste dem via REST før første WebSocket-besked
+# Kendte requirement-ID'er, navne og skill-minimumskrav
 _known_ar_ids: set[int] = set()
+_ar_names: dict[int, str] = {}
+_ar_skill_minimums: dict[int, dict[int, int]] = {}
 
 
-async def fetch_availability_snapshot() -> bool:
+async def fetch_ar_definitions() -> None:
     """
-    Forsøger at hente et frisk availability-snapshot via REST API i stedet
-    for at vente på en WebSocket-besked (som kun sendes ved ændringer).
+    Henter bemandingskravenes definitioner (navn + minimum pr. skill).
 
-    Bekræftet virkende: GET /api/v2/availability_requirements?group_id=X
-    – men denne returnerer kun definitioner (id, navn, skills), IKKE
-    aktuelle intervals/available_memberships. Holdes alligevel for at
-    auto-opdage requirement-ID'er og logge struktur til videre fejlfinding.
+    Bekræftet endpoint: GET /api/v2/availability_requirements?group_id=X
+    Returnerer KUN definitioner (ingen live status) – bruges til at
+    berige det live snapshot fra fetch_current_availability() med
+    minimumskrav pr. skill, så vi kan vise "above_buffer"/"below_buffer".
 
-    Returnerer True hvis mindst ét endpoint gav brugbar snapshot-data
-    (dvs. indeholdt "intervals").
+    Bemærk: feltet "assigned" i single_skill_availability_requirements
+    er forvirrende navngivet – det er det KONFIGUREREDE MINIMUM,
+    ikke en live optælling.
+    """
+    import requests as req_lib
+
+    token = await token_mgr.ensure_valid()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept":        "application/json",
+    }
+    url    = f"https://{BASE_URL}/api/v2/availability_requirements"
+    params = {"group_id": GROUP_ID}
+
+    loop = asyncio.get_event_loop()
+
+    def _fetch():
+        resp = req_lib.get(url, headers=headers, params=params, timeout=10)
+        return resp.status_code, resp.text
+
+    try:
+        status, raw = await loop.run_in_executor(None, _fetch)
+        if status != 200:
+            print(f"[AR] HTTP {status}: {raw[:200]}", flush=True)
+            return
+
+        data = json.loads(raw)
+        for entry in data:
+            ar_id = entry.get("id")
+            if not ar_id:
+                continue
+            _ar_names[ar_id] = entry.get("name", str(ar_id))
+            _known_ar_ids.add(ar_id)
+
+            mins: dict[int, int] = {}
+            for ss in entry.get("single_skill_availability_requirements", []):
+                skill_id = ss.get("skill_id")
+                minimum  = ss.get("assigned", 0)
+                if skill_id is not None:
+                    mins[skill_id] = minimum
+            _ar_skill_minimums[ar_id] = mins
+
+        names = ", ".join(_ar_names.values())
+        print(f"  → {len(data)} bemandingskrav hentet ({names})", flush=True)
+
+    except Exception as e:
+        print(f"[AR] Fejl ved hentning af krav-definitioner: {e}", flush=True)
+
+
+async def fetch_current_availability() -> bool:
+    """
+    Henter et live availability-snapshot via REST – bekræftet endpoint:
+
+        GET /api/v2/memberships/combined_schedules
+            ?group_ids=<GROUP_ID>&start_time=<nu, ISO8601 med offset>
+
+    Når start_time=nu, returnerer API'et for hver person ÉT interval
+    der dækker netop nu – ingen klient-side tidszone-matching er altså
+    nødvendig, modsat den gamle WebSocket-baserede tilgang.
+
+    Bruges: ved opstart, hvert minut i baggrunden, og ved tryk på
+    "Genopfrisk tilgængelighed"-knappen.
     """
     import requests as req_lib
 
@@ -1122,34 +934,128 @@ async def fetch_availability_snapshot() -> bool:
         "Accept":        "application/json",
     }
 
-    found_any = False
+    now = datetime.now(LOCAL_TZ).replace(microsecond=0)
+    url = f"https://{BASE_URL}/api/v2/memberships/combined_schedules"
+    params = {
+        "group_ids":  GROUP_ID,
+        "start_time": now.isoformat(),
+    }
+
     loop = asyncio.get_event_loop()
 
-    # 1) Hent liste over requirements for gruppen (bekræftet virkende)
-    list_url = f"https://{BASE_URL}/api/v2/availability_requirements?group_id={GROUP_ID}"
-
-    def _fetch(u):
-        resp = req_lib.get(u, headers=headers, timeout=10)
+    def _fetch():
+        resp = req_lib.get(url, headers=headers, params=params, timeout=10)
         return resp.status_code, resp.text
 
     try:
-        status, raw = await loop.run_in_executor(None, _fetch, list_url)
-        print(f"[SNAPSHOT] {list_url} -> HTTP {status}", flush=True)
-        log_write("_token", f"Snapshot liste {list_url} -> HTTP {status}: {raw[:1000]}")
-
-        if status == 200:
-            data = json.loads(raw)
-            if isinstance(data, list):
-                for entry in data:
-                    if isinstance(entry, dict) and entry.get("id"):
-                        _known_ar_ids.add(entry["id"])
-                        if "intervals" in entry:
-                            publish_availability(entry)
-                            found_any = True
+        status, raw = await loop.run_in_executor(None, _fetch)
     except Exception as e:
-        print(f"[SNAPSHOT] Fejl for liste-endpoint: {e}", flush=True)
+        print(f"[AVAILABILITY] REST-fejl: {e}", flush=True)
+        return False
 
-    return found_any
+    if status != 200:
+        print(f"[AVAILABILITY] HTTP {status}: {raw[:300]}", flush=True)
+        log_write("_token", f"combined_schedules HTTP {status}: {raw[:500]}")
+        return False
+
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        print(f"[AVAILABILITY] Kunne ikke parse JSON: {e}", flush=True)
+        return False
+
+    if not isinstance(data, list):
+        print(f"[AVAILABILITY] Uventet svar-type: {type(data)}", flush=True)
+        return False
+
+    # Filtrér til hovedgruppen – andre group_id'er i svaret er Hold 1-4
+    own_entries = [e for e in data if str(e.get("group_id")) == str(GROUP_ID)]
+
+    available_people: list[dict] = []
+    per_skill_names: dict[int, list[str]] = {}
+
+    for entry in own_entries:
+        uid       = entry.get("user_id")
+        intervals = entry.get("intervals", [])
+        if not uid or not intervals:
+            continue
+
+        iv           = intervals[0]   # Matcher altid forespurgt start_time = nu
+        is_available = bool(iv.get("available"))
+        skill_ids    = iv.get("skill_ids", [])
+        name         = _user_names.get(uid, f"bruger_{uid}")
+
+        publish_discovery_user_availability(uid, name)
+        mqtt_publish(
+            f"user/{uid}/availability",
+            {
+                "user_id":               uid,
+                "name":                  name,
+                "available":             is_available,
+                "status_label":          "Tilgængelig" if is_available else "Ikke tilgængelig",
+                "skill_ids":             skill_ids,
+                "assigned_function_ids": iv.get("assigned_function_ids", []),
+                "valid_until":           iv.get("end_time", ""),
+                "updated_at":            datetime.now().isoformat(timespec="seconds"),
+            },
+            retain=True,
+        )
+
+        if is_available:
+            available_people.append({"user_id": uid, "name": name})
+            for sk in skill_ids:
+                per_skill_names.setdefault(sk, []).append(name)
+
+    # Byg gruppe-niveau opsummering pr. kendt bemandingskrav
+    for ar_id in (_known_ar_ids or {1274}):
+        ar_name  = _ar_names.get(ar_id, str(ar_id))
+        minimums = _ar_skill_minimums.get(ar_id, {})
+
+        skill_summary = []
+        for skill_id, minimum in minimums.items():
+            names = per_skill_names.get(skill_id, [])
+            if len(names) >= minimum:
+                level = "above_buffer"
+            elif names:
+                level = "at_buffer"
+            else:
+                level = "below_buffer"
+            skill_summary.append({
+                "skill_id": skill_id,
+                "assigned": len(names),
+                "minimum":  minimum,
+                "level":    level,
+                "names":    names,
+            })
+
+        overall_ok = all(s["assigned"] >= s["minimum"] for s in skill_summary) if skill_summary else True
+
+        if ar_id not in _discovered_availability:
+            _discovered_availability.add(ar_id)
+            publish_discovery_availability(ar_id, ar_name)
+
+        mqtt_publish(
+            f"availability/{ar_id}",
+            {
+                "ar_id":            ar_id,
+                "name":             ar_name,
+                "level":            "above_buffer" if overall_ok else "below_buffer",
+                "level_label":      "OK" if overall_ok else "Undermandet",
+                "available_count":  len(available_people),
+                "available_people": available_people,
+                "skill_statuses":   skill_summary,
+                "updated_at":       datetime.now().isoformat(timespec="seconds"),
+            },
+            retain=True,
+        )
+
+    print(
+        f"[AVAILABILITY] REST-snapshot: {len(available_people)} tilgængelige "
+        f"af {len(own_entries)} medlemmer",
+        flush=True,
+    )
+    return True
+
 
 async def main() -> None:
     global _main_loop
@@ -1176,13 +1082,16 @@ async def main() -> None:
     publish_discovery_incident()
     publish_discovery_refresh_button()
 
+    print("Henter bemandingskrav (skills/minimum)...")
+    await fetch_ar_definitions()
+
     print("Henter frisk availability-snapshot via REST...")
-    got_snapshot = await fetch_availability_snapshot()
+    got_snapshot = await fetch_current_availability()
     if got_snapshot:
         print("  → Snapshot hentet og publiceret")
     else:
-        print("  → Intet snapshot-endpoint virkede – se [SNAPSHOT]-linjer ovenfor")
-        print("     (data opdateres når første WebSocket-besked ankommer)")
+        print("  → Snapshot fejlede – tjek log ovenfor")
+        print("     (opdateres automatisk hvert minut og ved manuel genopfriskning)")
 
     layout  = build_layout()
     console = Console()
