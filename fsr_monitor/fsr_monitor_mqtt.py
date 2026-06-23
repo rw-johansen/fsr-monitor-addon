@@ -1106,11 +1106,13 @@ async def fetch_availability_snapshot() -> bool:
     Forsøger at hente et frisk availability-snapshot via REST API i stedet
     for at vente på en WebSocket-besked (som kun sendes ved ændringer).
 
-    Da det eksakte REST-endpoint ikke er dokumenteret offentligt, afprøves
-    flere sandsynlige varianter, og det rå svar logges, så det kan
-    identificeres og rettes præcist.
+    Bekræftet virkende: GET /api/v2/availability_requirements?group_id=X
+    – men denne returnerer kun definitioner (id, navn, skills), IKKE
+    aktuelle intervals/available_memberships. Holdes alligevel for at
+    auto-opdage requirement-ID'er og logge struktur til videre fejlfinding.
 
-    Returnerer True hvis mindst ét endpoint gav brugbar data.
+    Returnerer True hvis mindst ét endpoint gav brugbar snapshot-data
+    (dvs. indeholdt "intervals").
     """
     import requests as req_lib
 
@@ -1120,55 +1122,32 @@ async def fetch_availability_snapshot() -> bool:
         "Accept":        "application/json",
     }
 
-    now = datetime.now(LOCAL_TZ)
-    start = now.strftime("%Y-%m-%dT00:00:00%z")
-    end   = (now + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00%z")
-
-    # Kendte/sandsynlige requirement-ID'er at prøve
-    ar_ids_to_try = list(_known_ar_ids) or [1274]  # 1274 = Nyborg, set som fallback
-
-    candidates = []
-    for ar_id in ar_ids_to_try:
-        candidates += [
-            f"https://{BASE_URL}/api/v2/availability_requirements/{ar_id}",
-            f"https://{BASE_URL}/api/v2/availability_requirements/{ar_id}?start_time={start}&end_time={end}",
-            f"https://{BASE_URL}/api/v2/availability_requirements/{ar_id}/intervals?start_time={start}&end_time={end}",
-            f"https://{BASE_URL}/api/v2/group_availability_requirements/{ar_id}",
-        ]
-    candidates += [
-        f"https://{BASE_URL}/api/v2/availability_requirements?group_id={GROUP_ID}",
-        f"https://{BASE_URL}/api/v2/groups/{GROUP_ID}/availability_requirements",
-    ]
-
-    loop = asyncio.get_event_loop()
     found_any = False
+    loop = asyncio.get_event_loop()
 
-    for url in candidates:
-        def _fetch(u=url):
-            resp = req_lib.get(u, headers=headers, timeout=10)
-            return resp.status_code, resp.text
+    # 1) Hent liste over requirements for gruppen (bekræftet virkende)
+    list_url = f"https://{BASE_URL}/api/v2/availability_requirements?group_id={GROUP_ID}"
 
-        try:
-            status, raw = await loop.run_in_executor(None, _fetch)
-            preview = raw[:400]
-            print(f"[SNAPSHOT] {url} -> HTTP {status}: {preview}", flush=True)
-            log_write("_token", f"Snapshot probe {url} -> HTTP {status}: {raw[:1000]}")
+    def _fetch(u):
+        resp = req_lib.get(u, headers=headers, timeout=10)
+        return resp.status_code, resp.text
 
-            if status == 200:
-                data = json.loads(raw)
-                # Hvis svaret indeholder intervals direkte, eller en liste
-                # af requirements, forsøg at publicere via eksisterende logik
-                if isinstance(data, dict) and "intervals" in data:
-                    publish_availability(data)
-                    found_any = True
-                elif isinstance(data, list):
-                    for entry in data:
-                        if isinstance(entry, dict) and "intervals" in entry:
+    try:
+        status, raw = await loop.run_in_executor(None, _fetch, list_url)
+        print(f"[SNAPSHOT] {list_url} -> HTTP {status}", flush=True)
+        log_write("_token", f"Snapshot liste {list_url} -> HTTP {status}: {raw[:1000]}")
+
+        if status == 200:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                for entry in data:
+                    if isinstance(entry, dict) and entry.get("id"):
+                        _known_ar_ids.add(entry["id"])
+                        if "intervals" in entry:
                             publish_availability(entry)
                             found_any = True
-
-        except Exception as e:
-            print(f"[SNAPSHOT] Fejl for {url}: {e}", flush=True)
+    except Exception as e:
+        print(f"[SNAPSHOT] Fejl for liste-endpoint: {e}", flush=True)
 
     return found_any
 
